@@ -102,12 +102,6 @@ int uthread_get_active_count(void);
 
 ## Building and Running
 
-### Prerequisites
-
-* POSIX-compliant system (Linux/BSD)
-* `pthread` library
-* C11-compliant compiler
-
 ### Compilation
 
 ```bash
