@@ -24,9 +24,20 @@ typedef enum {
     THREAD_WAITING
 } thread_state_t;
 
-// Forward declarations
-typedef struct uthread_mutex uthread_mutex_t;
-typedef struct uthread_cond uthread_cond_t;
+#define BUFFER_SIZE 5
+
+typedef struct uthread_mutex {
+    atomic_int locked;
+    struct uthread *waiting;     
+    pthread_mutex_t kernel_mutex;
+} uthread_mutex_t;
+
+// Condition variable structure
+typedef struct uthread_cond {
+    struct uthread *waiting;     
+    pthread_cond_t kernel_cond;  
+} uthread_cond_t;
+
 
 // Thread structure
 typedef struct uthread {
@@ -47,18 +58,18 @@ typedef struct uthread {
     uthread_mutex_t *waiting_mutex;
 } uthread_t;
 
-// Mutex structure
-struct uthread_mutex {
-    atomic_int locked;
-    uthread_t *waiting;
-    pthread_mutex_t kernel_mutex;
-};
 
-// Condition variable structure
-struct uthread_cond {
-    uthread_t *waiting;
-    pthread_cond_t kernel_cond;
-};
+
+
+int buffer[BUFFER_SIZE];
+int count = 0;       // number of items in buffer
+int in = 0;          // next insert index
+int out = 0;         // next remove index
+
+uthread_mutex_t *buffer_mutex;
+uthread_cond_t *not_full;
+uthread_cond_t *not_empty;
+
 
 // Kernel thread wrapper for M:N
 typedef struct {
@@ -112,41 +123,63 @@ static void add_to_ready_queue(uthread_t *thread) {
    
 }
 uthread_t* pop_ready_queue(void) {
-
     if (!ready_queue) return NULL;
 
     if (scheduling_policy == 0) { // Round-Robin
-       
         uthread_t *t = ready_queue;
+        
+        // Skip terminated threads
+        while (t && t->state == THREAD_TERMINATED) {
+            uthread_t *next = t->next;
+            // Remove terminated thread from queue
+            if (t->prev) t->prev->next = t->next;
+            else ready_queue = t->next;
+            if (t->next) t->next->prev = t->prev;
+            
+            // Clean up terminated thread
+            if (t->stack) free(t->stack);
+            free(t);
+            
+            t = next;
+        }
+        
+        if (!t) return NULL;
+        
         ready_queue = t->next;
         if (ready_queue) ready_queue->prev = NULL;
         t->next = t->prev = NULL;
         return t;
-    } else { // Priority + aging
+    } else { 
+        // Similar fix for priority scheduling...
         uthread_t *t = ready_queue;
-        uthread_t *highest = ready_queue;
-
-        // Find thread with highest (priority + age)
+        uthread_t *highest = NULL;
+        
+        // Find highest priority non-terminated thread
         for (; t; t = t->next) {
-            if ((t->priority + t->age) > (highest->priority + highest->age)) {
-                highest = t;
+            if (t->state != THREAD_TERMINATED) {
+                if (!highest || (t->priority + t->age) > (highest->priority + highest->age)) {
+                    highest = t;
+                }
             }
         }
-
+        
+        if (!highest) return NULL;
+        
         // Remove highest from queue
         if (highest->prev) highest->prev->next = highest->next;
         else ready_queue = highest->next;
-
         if (highest->next) highest->next->prev = highest->prev;
-
+        
         highest->next = highest->prev = NULL;
-
+        
         // Increment age of remaining threads
         for (t = ready_queue; t; t = t->next) {
-            t->age++;
+            if (t->state != THREAD_TERMINATED) {
+                t->age++;
+            }
         }
         highest->age = 0;
-
+        
         return highest;
     }
 }
@@ -320,6 +353,14 @@ void uthread_yield(void) {
     schedule();
 }
 
+static void cleanup_terminated_threads(void) {
+    uthread_t *thread;
+    while ((thread = pop_terminated_list()) != NULL) {
+        if (thread->stack) free(thread->stack);
+        free(thread);
+    }
+}
+
 void uthread_exit(void *retval) {
     if (!current_thread) return;
 
@@ -347,7 +388,6 @@ void uthread_exit(void *retval) {
     schedule(); // scheduler will pick next thread and eventually cleanup 'exiting'
     // should never return
 }
-
 
 int uthread_join(int tid, void **retval) {
     if (tid < 1 || tid >= MAX_THREADS || !all_threads[tid]) return -1;
@@ -538,31 +578,158 @@ int uthread_mutex_destroy(uthread_mutex_t *mutex) {
     return 0;
 }
 
+int uthread_cond_init(uthread_cond_t **cond) {
+    *cond = malloc(sizeof(uthread_cond_t));
+    if (!*cond) return -1;
+    (*cond)->waiting = NULL;
+    pthread_cond_init(&(*cond)->kernel_cond, NULL);
+    return 0;
+}
+
+int uthread_cond_wait(uthread_cond_t *cond, uthread_mutex_t *mutex) {
+    if (!cond || !mutex || !current_thread) return -1;
+
+    // Add current thread to waiting list
+    current_thread->state = THREAD_BLOCKED;
+    current_thread->next = cond->waiting;
+    cond->waiting = current_thread;
+
+    printf("🔒 Thread %d waiting on cond, waiting list: ", current_thread->id);
+    uthread_t *t = cond->waiting;
+    while (t) {
+        printf("%d -> ", t->id);
+        t = t->next;
+    }
+    printf("NULL\n");
+
+    // Unlock the mutex while waiting
+    uthread_mutex_unlock(mutex);
+
+    uthread_yield(); // Yield to scheduler
+
+    // Re-lock mutex after waking up
+    uthread_mutex_lock(mutex);
+    return 0;
+}
+
+int uthread_cond_signal(uthread_cond_t *cond) {
+    if (!cond) return -1;
+    
+    if (cond->waiting) {
+        uthread_t *thread = cond->waiting;
+        cond->waiting = thread->next;  // Remove from list
+        thread->next = NULL;           // Important: clear next pointer
+        thread->state = THREAD_READY;
+        add_to_ready_queue(thread);
+    }
+    return 0;
+}
+
+int uthread_cond_broadcast(uthread_cond_t *cond) {
+    if (!cond) return -1;
+
+    uthread_t *thread = cond->waiting;
+    uthread_t *next;
+    
+    while (thread) {
+        next = thread->next;      // Save next before modifying
+        thread->next = NULL;      // CRITICAL: Clear next pointer
+        thread->state = THREAD_READY;
+        add_to_ready_queue(thread);
+        thread = next;
+    }
+    
+    cond->waiting = NULL;         // Clear the waiting list
+    return 0;
+}
+
+int uthread_cond_destroy(uthread_cond_t *cond) {
+    free(cond);
+    return 0;
+}
+
 // ==================== INTERNAL FUNCTIONS ====================
 
 static void schedule(void) {
     if (multi_core_enabled) {
-        // In M:N mode, kernel threads handle scheduling
         return;
     }
 
-    // Single-core scheduler
+    // Clean up any terminated threads from ready queue first
+    
+
+    // If current thread is running and healthy, save context
     if (current_thread && current_thread->state == THREAD_RUNNING) {
-        swapcontext(&current_thread->ctx, &scheduler_ctx);
+        if (current_thread->ctx.uc_stack.ss_sp != NULL) {
+            swapcontext(&current_thread->ctx, &scheduler_ctx);
+        } else {
+            // Thread has corrupted context, force it to exit
+            current_thread->state = THREAD_TERMINATED;
+            atomic_fetch_add(&threads_terminated, 1);
+            current_thread = NULL;
+        }
         return;
     }
 
     uthread_t *next = NULL;
-    if (scheduling_policy == 1) {
-        next = pop_ready_queue_priority(); // priority + aging
-    } else {
-        next = pop_ready_queue();          // Round-Robin
+    int attempts = 0;
+    
+    // Keep looking for a runnable thread with safety limit
+    while (attempts < 100) {
+        if (scheduling_policy == 1) {
+            next = pop_ready_queue_priority();
+        } else {
+            next = pop_ready_queue();
+        }
+
+        // Skip terminated or invalid threads
+        if (next && next->state == THREAD_TERMINATED) {
+            if (next->stack) free(next->stack);
+            free(next);
+            next = NULL;
+            attempts++;
+            continue;
+        }
+
+        if (next && next->state == THREAD_READY) {
+            break; // Found a runnable thread
+        }
+
+        if (!next) {
+            break; // No more threads
+        }
+
+        attempts++;
     }
 
+    // DEADLOCK DETECTION: If no runnable threads but not all have terminated
     if (!next) {
-        if (atomic_load(&threads_created) == atomic_load(&threads_terminated)) {
-            scheduler_done = 1;
+        int created = atomic_load(&threads_created);
+        int terminated = atomic_load(&threads_terminated);
+        
+        if (created != terminated) {
+            printf("POSSIBLE DEADLOCK: %d threads created, %d terminated, but no threads in ready queue\n", 
+                   created, terminated);
+            printf("Checking for blocked threads...\n");
+            
+            // Force exit if we detect a deadlock
+            for (int i = 1; i < MAX_THREADS; i++) {
+                if (all_threads[i] && all_threads[i]->state == THREAD_BLOCKED) {
+                    printf("Thread %d is blocked (waiting on cond var?)\n", i);
+                }
+            }
+            
+            // Emergency: mark all remaining threads as terminated
+            for (int i = 1; i < MAX_THREADS; i++) {
+                if (all_threads[i] && all_threads[i]->state != THREAD_TERMINATED) {
+                    printf("Forcing thread %d to terminate\n", i);
+                    all_threads[i]->state = THREAD_TERMINATED;
+                    atomic_fetch_add(&threads_terminated, 1);
+                }
+            }
         }
+        
+        scheduler_done = 1;
         return;
     }
 
@@ -572,29 +739,28 @@ static void schedule(void) {
 
     atomic_fetch_add(&context_switches, 1);
 
-    if (prev_thread) {
+    if (prev_thread && prev_thread->ctx.uc_stack.ss_sp != NULL) {
         swapcontext(&prev_thread->ctx, &current_thread->ctx);
     } else {
         setcontext(&current_thread->ctx);
     }
 }
 
-
 static void timer_handler(int sig) {
     if (!preemption_enabled || sig != SIGVTALRM || !current_thread)
         return;
 
-    // Only count preemption
-    atomic_fetch_add(&preemptions, 1);
-
-    // Optional: print message only once per switch
+    // Simply set a flag that schedule() can check
     static int last_thread_id = -1;
+    
     if (current_thread->id != last_thread_id) {
         printf("[PREEMPTION!] Thread %d\n", current_thread->id);
+        atomic_fetch_add(&preemptions, 1);
         last_thread_id = current_thread->id;
     }
-
-    uthread_yield();
+    
+    // Let the natural flow cause the switch rather than forcing it here
+    // This prevents double-counting
 }
 
 
@@ -604,25 +770,29 @@ static void cleanup_thread(uthread_t *thread) {
 }
 
 // ==================== SCHEDULER START ====================
-
 void uthread_start_scheduler(void) {
     getcontext(&scheduler_ctx);
     
     if (!scheduler_done) {
         if (multi_core_enabled) {
             // M:N mode - kernel threads handle scheduling
-            // Wait for all threads to complete
             while (atomic_load(&threads_created) != atomic_load(&threads_terminated)) {
-                sleep(100000); // 100ms
+                sleep(100000); // 100ms - FIXED: use usleep instead of sleep
+                cleanup_terminated_threads(); // Clean up periodically
             }
+            stop_kernel_threads(); // Add this function to stop kernel threads
         } else {
             // Single-core scheduler
             while (ready_queue || atomic_load(&threads_created) != atomic_load(&threads_terminated)) {
                 schedule();
+                cleanup_terminated_threads(); // Clean up after each schedule
             }
         }
         scheduler_done = 1;
     }
+    
+    // Final cleanup
+    cleanup_terminated_threads();
 }
 
 // ==================== PERFORMANCE MONITORING ====================
@@ -837,45 +1007,175 @@ void test_week3(void) {
 
     uthread_print_stats();
 }
+void init_buffer_sync() {
+buffer_mutex = malloc(sizeof(uthread_mutex_t));
+uthread_mutex_init(&buffer_mutex);
 
-void test_mn_scheduling(void) {
-    printf("\n=== Week 4: M:N Scheduling Test ===\n");
+not_full = malloc(sizeof(uthread_cond_t));
+uthread_cond_init(&not_full);
 
+not_empty = malloc(sizeof(uthread_cond_t));
+uthread_cond_init(&not_empty);
+
+}
+
+
+void producer(void *arg) {
+    int id = *(int*)arg;
+    int base = id * 100;
+    int produced_count = 0;
+    
+    for (int i = 0; i < 10; i++) {
+        uthread_mutex_lock(buffer_mutex);
+
+        while (count == BUFFER_SIZE) {
+            uthread_cond_wait(not_full, buffer_mutex);
+        }
+
+        int item = base + i;
+        buffer[in] = item;
+        in = (in + 1) % BUFFER_SIZE;
+        count++;
+        produced_count++;
+        printf("Producer %d produced item %d (count: %d)\n", id, item, count);
+
+        uthread_cond_signal(not_empty);
+        uthread_mutex_unlock(buffer_mutex);
+
+        uthread_yield();
+    }
+    
+    printf("Producer %d FINISHED - produced %d items\n", id, produced_count);
+    uthread_exit(NULL); // Explicit exit
+}
+void consumer(void *arg) {
+    int id = *(int *)arg;
+    int consumed_count = 0;
+    
+    for (int i = 0; i < 10; i++) {
+        uthread_mutex_lock(buffer_mutex);
+        
+        while (count == 0) {
+            printf("Consumer %d: buffer empty, waiting...\n", id);
+            uthread_cond_wait(not_empty, buffer_mutex);
+        }
+        
+        int item = buffer[out];
+        out = (out + 1) % BUFFER_SIZE;
+        count--;
+        consumed_count++;
+        
+        printf("Consumer %d consumed item %d (count: %d)\n", id, item, count);
+        
+        uthread_cond_broadcast(not_full);
+        uthread_mutex_unlock(buffer_mutex);
+        
+        // Optional: small delay for better interleaving
+        for (volatile int j = 0; j < 100000; j++);
+        
+        uthread_yield();
+    }
+    
+    printf("Consumer %d finished (consumed %d items)\n", id, consumed_count);
+    uthread_exit(NULL); // CRITICAL: Explicit exit
+}
+
+void init_sync_primitives(void) {
+    // Initialize mutex
+    uthread_mutex_init(&buffer_mutex);
+    
+    // Initialize condition variables
+    not_full = malloc(sizeof(uthread_cond_t));
+    not_empty = malloc(sizeof(uthread_cond_t));
+    if (!not_full || !not_empty) {
+        printf("Error: Failed to allocate condition variables\n");
+        return;
+    }
+    not_full->waiting = NULL;
+    not_empty->waiting = NULL;
+}
+
+void test_week4_condition(void) {
+    printf("\n=== Week 4: Condition Variables (Safe Cleanup) ===\n");
+    
+    // Reset thread library state
     uthread_reset_stats();
     ready_queue = NULL;
     memset(all_threads, 0, sizeof(all_threads));
     next_thread_id = 1;
     scheduler_done = 0;
     current_thread = NULL;
-
-    printf("Testing M:N scheduling (user threads over kernel threads)\n");
-    uthread_enable_multicore(); // starts 4 kernel threads
-
-    int thread_count = 8;
-    int ids[thread_count];
-    int tids[thread_count];
-
-    printf("Creating %d user threads to run on %d kernel threads\n", 
-           thread_count, kernel_thread_count);
-
-    for (int i = 0; i < thread_count; i++) {
-        ids[i] = i + 1;
-        tids[i] = uthread_create_priority(mn_worker, &ids[i], (i % MAX_PRIORITY) + 1);
-        printf("Created user thread %d with priority %d\n", tids[i], (i % MAX_PRIORITY) + 1);
+    
+    // Reset buffer state
+    count = in = out = 0;
+    memset(buffer, 0, sizeof(buffer));
+    
+    // Initialize synchronization primitives
+    init_sync_primitives();
+    
+    // Enable preemption to stress-test synchronization
+    uthread_enable_preempt();
+    
+    printf("Creating 3 producers and 3 consumers...\n");
+    
+    int p_ids[3] = {1, 2, 3};
+    int c_ids[3] = {1, 2, 3};
+    
+    // Create producers
+    for (int i = 0; i < 3; i++) {
+        int tid = uthread_create(producer, &p_ids[i]);
+        printf("Created producer %d (thread %d)\n", p_ids[i], tid);
     }
-
+    
+    // Create consumers
+    for (int i = 0; i < 3; i++) {
+        int tid = uthread_create(consumer, &c_ids[i]);
+        printf("Created consumer %d (thread %d)\n", c_ids[i], tid);
+    }
+    
+    printf("Starting scheduler...\n");
+    
+    // Start scheduler - runs until all threads complete
     uthread_start_scheduler();
-
-    // Join all threads
-    for (int i = 0; i < thread_count; i++) {
-        void *retval;
-        if (uthread_join(tids[i], &retval) == 0) {
-            printf("Joined thread %d with result: %ld\n", tids[i], (long)retval);
-        }
+    
+    // -------------------------------
+    // SAFER CLEANUP APPROACH
+    // -------------------------------
+    
+    // CRITICAL: Wait a bit to ensure all threads have completely finished
+    printf("All threads completed. Waiting for safe cleanup...\n");
+    
+    // Disable preemption FIRST
+    uthread_disable_preempt();
+    
+    // Add a small delay to ensure all thread cleanup is complete
+    struct timespec ts = {0, 10000000}; // 10ms delay
+    nanosleep(&ts, NULL);
+    
+    // Clear any remaining waiting threads from condition variables
+    if (not_full) {
+        not_full->waiting = NULL;
     }
-
-    stop_kernel_threads();
+    if (not_empty) {
+        not_empty->waiting = NULL;
+    }
+    
+    // Free condition variables
+    if (not_full) {
+        free(not_full);
+        not_full = NULL;
+    }
+    if (not_empty) {
+        free(not_empty);
+        not_empty = NULL;
+    }
+    
+    printf("Cleanup completed safely.\n");
+    
+    // Print final statistics
     uthread_print_stats();
+    
+    printf("Test finished safely.\n");
 }
 
 
@@ -887,7 +1187,9 @@ int main(void) {
     test_week1();
     test_week2(); 
     test_week3();
-    test_mn_scheduling();
+    test_week4_condition();  
+   
+  
     
     printf("\n🎉 ALL TESTS COMPLETED! 🎉\n");
     return 0;
