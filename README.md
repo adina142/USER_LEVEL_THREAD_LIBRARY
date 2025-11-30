@@ -1,34 +1,38 @@
 # Enhanced User-Level Thread Library
 
-A comprehensive **user-level thread library** implementing the **M:N threading model** with advanced scheduling, synchronization primitives, and performance monitoring.  
+A **high-performance user-level thread library** implementing the **M:N threading model**, offering advanced scheduling, synchronization primitives, and detailed performance monitoring for robust multithreaded applications.
 
 ---
 
 ## Features
 
-### 🧵 Thread Management
-- **M:N Threading Model**: Multiple user threads mapped to kernel threads.  
-- **Priority Scheduling**: Dynamic priority-based scheduling with aging.  
-- **Round-Robin Scheduling**: Fair time-sliced scheduling policy.  
-- **Preemptive Scheduling**: Timer-based thread preemption.  
-- **Multicore Support**: Thread affinity and parallel execution.  
+###  Thread Management
 
-### 🔒 Synchronization Primitives
-- **Mutexes**: Fast user-level mutexes with blocking.  
-- **Condition Variables**: Full support for condition variables.  
-- **Producer-Consumer**: Bounded buffer with proper synchronization.  
-- **Deadlock Detection**: Automatic deadlock detection and recovery.  
+* **M:N Threading Model**: Multiple user threads mapped onto a smaller set of kernel threads for efficiency.
+* **Priority Scheduling**: Dynamic priority-based scheduling with aging to prevent starvation.
+* **Round-Robin Scheduling**: Fair, time-sliced thread execution.
+* **Preemptive Scheduling**: Timer-based thread preemption for responsive multitasking.
+* **Multicore Support**: Thread affinity and parallel execution across multiple cores.
 
-### 📊 Performance Monitoring
-- **Comprehensive Statistics**: Context switches, yields, preemptions.  
-- **Real-time Metrics**: Active thread count, synchronization events.  
-- **Configurable Policies**: Runtime scheduling policy changes.  
+###  Synchronization Primitives
+
+* **Mutexes**: Fast user-level mutexes with blocking support.
+* **Condition Variables**: Full-featured condition variable support for complex coordination.
+* **Producer-Consumer**: Bounded buffer synchronization for concurrent workflows.
+* **Deadlock Detection**: Automatic detection and recovery from deadlocks.
+
+###  Performance Monitoring
+
+* **Statistics Tracking**: Context switches, yields, and preemptions.
+* **Real-Time Metrics**: Active thread counts and synchronization events.
+* **Configurable Policies**: Change scheduling policies at runtime.
 
 ---
 
 ## API Reference
 
 ### Thread Management
+
 ```c
 int uthread_create(void (*fn)(void *), void *arg);
 int uthread_create_priority(void (*fn)(void *), void *arg, int priority);
@@ -36,110 +40,121 @@ void uthread_yield(void);
 void uthread_exit(void *retval);
 int uthread_join(int tid, void **retval);
 int uthread_self(void);
-Scheduling Control
+
 void uthread_set_scheduling(int policy);
 void uthread_enable_preempt(void);
 void uthread_disable_preempt(void);
 void uthread_enable_multicore(void);
 void uthread_set_affinity(int tid, int core);
+```
 
-Synchronization
-Mutex Operations
+### Synchronization
+
+#### Mutex Operations
+
+```c
 int uthread_mutex_init(uthread_mutex_t **mutex);
 int uthread_mutex_lock(uthread_mutex_t *mutex);
 int uthread_mutex_trylock(uthread_mutex_t *mutex);
 int uthread_mutex_unlock(uthread_mutex_t *mutex);
 int uthread_mutex_destroy(uthread_mutex_t *mutex);
+```
 
-Condition Variables
+#### Condition Variables
+
+```c
 int uthread_cond_init(uthread_cond_t **cond);
 int uthread_cond_wait(uthread_cond_t *cond, uthread_mutex_t *mutex);
 int uthread_cond_signal(uthread_cond_t *cond);
 int uthread_cond_broadcast(uthread_cond_t *cond);
 int uthread_cond_destroy(uthread_cond_t *cond);
+```
 
-Statistics
+### Statistics
+
+```c
 void uthread_print_stats(void);
 void uthread_reset_stats(void);
 int uthread_get_created_count(void);
 int uthread_get_terminated_count(void);
 int uthread_get_active_count(void);
+```
 
-Architecture
-Thread States
+---
 
-THREAD_READY: Ready for execution.
+## Architecture Overview
 
-THREAD_RUNNING: Currently executing.
+### Thread States
 
-THREAD_BLOCKED: Waiting for synchronization.
+* **THREAD_READY**: Ready for execution.
+* **THREAD_RUNNING**: Currently executing.
+* **THREAD_BLOCKED**: Waiting for synchronization.
+* **THREAD_TERMINATED**: Finished execution.
+* **THREAD_WAITING**: Waiting on a condition variable.
 
-THREAD_TERMINATED: Finished execution.
+### Key Components
 
-THREAD_WAITING: Waiting on condition variable.
+* **Thread Control Block (TCB)**: Stores context (`ucontext_t`), stack, priority, scheduling data, and synchronization state.
+* **Scheduler**: Selects threads based on policy, handles preemption, and balances load across cores.
+* **Synchronization Module**: Implements mutexes, condition variables, and deadlock detection.
 
-Key Components
+---
 
-Thread Control Block (TCB): Stores context (ucontext_t), stack, priority, scheduling data, and synchronization state.
+## Building and Running
 
-Scheduler: Policy-based thread selection, preemption, and multicore load balancing.
+### Prerequisites
 
-Synchronization: User-level mutexes, condition variables, and deadlock detection.
+* POSIX-compliant system (Linux/BSD)
+* `pthread` library
+* C11-compliant compiler
 
-Building and Running
-Prerequisites
+### Compilation
 
-POSIX-compliant system (Linux/BSD)
-
-pthread library
-
-C11 compiler
-
-Compilation
+```bash
 gcc -std=c11 -D_XOPEN_SOURCE=700 -o uthread main.c -lpthread
+```
 
-Running Tests
+### Running Tests
+
+```bash
 ./uthread
+```
 
+**Test Suite:**
 
-The test suite includes:
+* Week 1: Basic cooperative threading
+* Week 2: Preemption and mutex synchronization
+* Week 3: Priority scheduling
+* Week 4: Condition variables and producer-consumer
 
-Week 1: Basic cooperative threading
+---
 
-Week 2: Preemption and mutex synchronization
+## Configuration
 
-Week 3: Priority scheduling
+### Scheduling Policies
 
-Week 4: Condition variables and producer-consumer
+* `0`: Round-Robin (default)
+* `1`: Priority-based with aging
 
-Configuration
-Scheduling Policies
+### System Limits
 
-0: Round-Robin (default)
+* Maximum threads: 256
+* Maximum kernel threads: 4
+* Stack size: 128KB per thread
+* Priority levels: 0-10
 
-1: Priority-based with aging
+### Performance Characteristics
 
-System Limits
+* **Low Overhead**: Efficient user-level context switches
+* **Scalable**: M:N threading model
+* **Fair**: Priority aging prevents starvation
+* **Robust**: Deadlock detection and recovery
 
-Maximum threads: 256
+---
 
-Maximum kernel threads: 4
+## Example Usage
 
-Stack size: 128KB per thread
-
-Priority levels: 0-10
-
-Performance Characteristics
-
-Low Overhead: User-level context switches.
-
-Scalable: M:N threading model.
-
-Fair: Priority aging prevents starvation.
-
-Robust: Deadlock detection and recovery.
-
-Example Usage
+```c
 #include "uthread.h"
 
 void worker(void *arg) {
@@ -160,13 +175,15 @@ int main() {
     uthread_print_stats();
     return 0;
 }
+```
 
-Safety Features
+---
 
-Stack Protection: Automatic stack cleanup.
+## Safety Features
 
-Memory Management: Proper allocation/deallocation.
+* **Stack Protection**: Automatic stack cleanup
+* **Memory Management**: Proper allocation and deallocation
+* **Error Handling**: Comprehensive error checking
+* **Thread Safety**: Atomic operations for shared data
 
-Error Handling: Comprehensive error checking.
-
-Thread Safety: Atomic operations for shared data.
+---
